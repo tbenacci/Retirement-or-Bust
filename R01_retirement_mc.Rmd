@@ -1,0 +1,593 @@
+---
+title: "Retirement Portfolio Monte Carlo Simulation"
+author: "Thomas Benacci"
+date: "2025-11-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Libraries
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+```
+
+# Load Personalized Mortality Profile
+
+```{r}
+mort <- readRDS("F:/PredictingMortality/mc_mortality_input.rds")
+
+cat("Current age:            ", mort$current_age, "\n")
+cat("Expected death age:     ", round(mort$expected_death_age, 1), "\n")
+cat("Median death age:       ", round(mort$median_death_age, 1), "\n")
+cat("Std dev:                ", round(mort$sd_death_age, 1), "\n")
+cat("\nPercentiles:\n")
+print(mort$percentiles)
+```
+
+# ============================================================
+# YOUR FINANCIAL INPUTS
+# All dollar amounts are in TODAY'S dollars.
+# ============================================================
+
+## Income & Career
+
+```{r}
+current_age       <- mort$current_age
+retirement_age    <- 65       # When you plan to stop working
+current_income    <- 75000    # Current annual gross income (today's $)
+real_income_growth <- 0.02    # Real annual income growth (above inflation)
+savings_rate      <- 0.20     # Fraction of gross income saved per year
+```
+
+## Portfolio
+
+```{r}
+current_portfolio <- 50000    # Current total retirement savings (today's $)
+stock_allocation  <- 0.70     # Fraction in equities (rest in bonds)
+# Rebalanced annually to this target
+```
+
+## Retirement Spending
+
+```{r}
+# Annual spending in retirement (today's dollars)
+# This will grow with realized inflation each year in the simulation.
+annual_spending   <- 50000
+
+# Social Security or pension (today's dollars, COLA-adjusted with inflation)
+social_security   <- 24000    # Annual SS benefit
+ss_start_age      <- 67       # Age SS payments begin
+```
+
+## Return & Inflation Assumptions
+
+Returns are NOMINAL. Inflation is modeled as a separate stochastic process,
+correlated with stock and bond returns. Real values are computed per-path
+by deflating nominal values by each path's realized cumulative inflation.
+
+Historical calibration (US 1926-2023, approximate):
+
+```{r}
+# Nominal stock parameters
+stock_mean_nom <- 0.10     # Expected nominal return
+stock_sd       <- 0.19     # Annual volatility
+
+# Nominal bond parameters (intermediate-term)
+bond_mean_nom  <- 0.05     # Expected nominal return
+bond_sd        <- 0.07     # Annual volatility
+
+# Inflation parameters
+infl_mean      <- 0.03     # Expected annual inflation
+infl_sd        <- 0.02     # Inflation volatility (historically ~1.5-2.5%)
+
+# Correlations (approximate historical)
+corr_stock_bond <- 0.10    # Stocks and bonds
+corr_stock_infl <- 0.02    # Stocks and inflation (weak positive)
+corr_bond_infl  <- -0.30   # Bonds and inflation (negative: bonds hurt by inflation)
+```
+
+## Simulation Parameters
+
+```{r}
+n_sims       <- 10000   # Number of Monte Carlo simulations
+max_age      <- 105     # Hard ceiling
+set.seed(42)
+```
+
+# ============================================================
+# SIMULATION ENGINE
+# ============================================================
+
+## Sample Death Ages
+
+```{r}
+sample_death_age <- function(n, mort_table) {
+  u <- runif(n)
+  sapply(u, function(p) {
+    idx <- which(mort_table$cum_death_prob >= p)[1]
+    if (is.na(idx)) return(max(mort_table$age))
+    mort_table$age[idx]
+  })
+}
+
+death_ages <- sample_death_age(n_sims, mort$mortality_table)
+
+cat("Sampled death ages:\n")
+cat("  Mean:   ", round(mean(death_ages), 1), "\n")
+cat("  Median: ", round(median(death_ages), 1), "\n")
+cat("  Min:    ", min(death_ages), "  Max:", max(death_ages), "\n")
+```
+
+## Build 3x3 Covariance Matrix and Cholesky Factor
+
+```{r}
+# Order: stocks, bonds, inflation
+corr_matrix <- matrix(c(
+  1,                corr_stock_bond,  corr_stock_infl,
+  corr_stock_bond,  1,                corr_bond_infl,
+  corr_stock_infl,  corr_bond_infl,   1
+), nrow = 3, byrow = TRUE)
+
+sd_vec <- c(stock_sd, bond_sd, infl_sd)
+cov_matrix <- diag(sd_vec) %*% corr_matrix %*% diag(sd_vec)
+
+# Verify positive-definiteness
+stopifnot(all(eigen(cov_matrix)$values > 0))
+
+chol_L <- chol(cov_matrix)  # Upper Cholesky: z %*% chol_L gives correlated draws
+
+# Log-normal drift adjustments (so E[exp(X)] matches desired arithmetic mean)
+stock_drift <- log(1 + stock_mean_nom) - stock_sd^2 / 2
+bond_drift  <- log(1 + bond_mean_nom)  - bond_sd^2 / 2
+infl_drift  <- log(1 + infl_mean)      - infl_sd^2 / 2
+
+generate_paths <- function(n_years) {
+  z <- matrix(rnorm(n_years * 3), ncol = 3)
+  corr_z <- z %*% chol_L
+  data.frame(
+    stock_r = exp(stock_drift + corr_z[, 1]) - 1,
+    bond_r  = exp(bond_drift  + corr_z[, 2]) - 1,
+    infl_r  = exp(infl_drift  + corr_z[, 3]) - 1
+  )
+}
+
+cat("Covariance matrix (stocks, bonds, inflation):\n")
+print(round(cov_matrix, 5))
+```
+
+## Run Simulation
+
+```{r}
+n_years_max <- max_age - current_age
+
+# Storage: nominal portfolio, real portfolio, and cumulative price level
+nominal_matrix  <- matrix(NA, nrow = n_sims, ncol = n_years_max + 1)
+real_matrix     <- matrix(NA, nrow = n_sims, ncol = n_years_max + 1)
+price_level_mat <- matrix(NA, nrow = n_sims, ncol = n_years_max + 1)
+ruin_age        <- rep(NA, n_sims)
+
+for (i in 1:n_sims) {
+  
+  portfolio_nom <- current_portfolio
+  income_nom    <- current_income
+  spending_nom  <- annual_spending
+  ss_nom        <- social_security
+  price_level   <- 1.0          # Cumulative price level (1 = today's dollars)
+  death         <- death_ages[i]
+  
+  paths <- generate_paths(n_years_max)
+  
+  for (t in 1:n_years_max) {
+    age <- current_age + t - 1
+    if (age >= death) break
+    
+    # Record state at start of year
+    nominal_matrix[i, t]  <- portfolio_nom
+    price_level_mat[i, t] <- price_level
+    real_matrix[i, t]     <- portfolio_nom / price_level
+    
+    # This year's realized inflation
+    infl_this_year <- paths$infl_r[t]
+    
+    # --- Cash flows (all nominal) ---
+    if (age < retirement_age) {
+      contribution_nom <- income_nom * savings_rate
+      withdrawal_nom   <- 0
+      income_nom <- income_nom * (1 + infl_this_year) * (1 + real_income_growth)
+    } else {
+      ss_this_year <- ifelse(age >= ss_start_age, ss_nom, 0)
+      withdrawal_nom   <- max(spending_nom - ss_this_year, 0)
+      contribution_nom <- 0
+    }
+    
+    # Nominal portfolio return (blended)
+    r_blend <- stock_allocation * paths$stock_r[t] +
+               (1 - stock_allocation) * paths$bond_r[t]
+    
+    # Update nominal portfolio
+    portfolio_nom <- portfolio_nom - withdrawal_nom
+    
+    if (portfolio_nom <= 0) {
+      portfolio_nom <- 0
+      if (is.na(ruin_age[i])) ruin_age[i] <- age
+      nominal_matrix[i, t] <- 0
+      real_matrix[i, t]    <- 0
+      price_level  <- price_level * (1 + infl_this_year)
+      spending_nom <- spending_nom * (1 + infl_this_year)
+      ss_nom       <- ss_nom * (1 + infl_this_year)
+      next
+    }
+    
+    portfolio_nom <- portfolio_nom * (1 + r_blend) + contribution_nom
+    portfolio_nom <- max(portfolio_nom, 0)
+    
+    # Advance price level and nominal cash flows
+    price_level  <- price_level * (1 + infl_this_year)
+    spending_nom <- spending_nom * (1 + infl_this_year)
+    ss_nom       <- ss_nom * (1 + infl_this_year)
+  }
+  
+  # Record final values
+  final_t <- min(death - current_age, n_years_max)
+  if (final_t > 0 && final_t <= ncol(nominal_matrix)) {
+    nominal_matrix[i, final_t]  <- portfolio_nom
+    price_level_mat[i, final_t] <- price_level
+    real_matrix[i, final_t]     <- portfolio_nom / price_level
+  }
+}
+
+cat("Simulation complete:", n_sims, "runs\n")
+```
+
+# ============================================================
+# RESULTS (all reported in today's dollars unless noted)
+# ============================================================
+
+# Probability of Ruin
+
+```{r}
+n_ruined <- sum(!is.na(ruin_age))
+prob_ruin <- n_ruined / n_sims
+
+cat("=== PROBABILITY OF RUIN ===\n")
+cat("Portfolio depleted before death: ", n_ruined, "/", n_sims, "\n")
+cat("Probability of ruin:             ", sprintf("%.1f%%", prob_ruin * 100), "\n")
+cat("Probability of success:          ", sprintf("%.1f%%", (1 - prob_ruin) * 100), "\n\n")
+
+if (n_ruined > 0) {
+  cat("Among ruined scenarios:\n")
+  cat("  Mean ruin age:    ", round(mean(ruin_age, na.rm = TRUE), 1), "\n")
+  cat("  Median ruin age:  ", round(median(ruin_age, na.rm = TRUE), 1), "\n")
+  cat("  Earliest ruin:    ", min(ruin_age, na.rm = TRUE), "\n")
+  cat("  Years in ruin:    ", round(mean(death_ages[!is.na(ruin_age)] - ruin_age[!is.na(ruin_age)]), 1), "avg\n")
+}
+```
+
+# Inflation Paths
+
+```{r, fig.width=9, fig.height=5}
+pct_infl <- do.call(rbind, lapply(1:n_years_max, function(t) {
+  vals <- price_level_mat[, t]
+  vals <- vals[!is.na(vals)]
+  if (length(vals) < 10) return(NULL)
+  data.frame(
+    age = current_age + t - 1,
+    p10 = quantile(vals, 0.10), p25 = quantile(vals, 0.25),
+    p50 = quantile(vals, 0.50), p75 = quantile(vals, 0.75),
+    p90 = quantile(vals, 0.90)
+  )
+}))
+
+ggplot(pct_infl, aes(x = age)) +
+  geom_ribbon(aes(ymin = p10, ymax = p90), fill = "darkorange", alpha = 0.15) +
+  geom_ribbon(aes(ymin = p25, ymax = p75), fill = "darkorange", alpha = 0.25) +
+  geom_line(aes(y = p50), color = "darkorange", linewidth = 1.2) +
+  labs(title = "Cumulative Price Level (Stochastic Inflation)",
+       subtitle = "1.0 = today's purchasing power | Median, IQR, and 10-90 bands",
+       x = "Age", y = "Price Level (1 = today)") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 16, face = "bold"))
+```
+
+# Portfolio Value Trajectories (Today's Dollars)
+
+```{r, fig.width=10, fig.height=7}
+pct_real <- do.call(rbind, lapply(1:n_years_max, function(t) {
+  vals <- real_matrix[, t]
+  vals <- vals[!is.na(vals)]
+  if (length(vals) < 10) return(NULL)
+  data.frame(
+    age = current_age + t - 1,
+    p10 = quantile(vals, 0.10), p25 = quantile(vals, 0.25),
+    p50 = quantile(vals, 0.50), p75 = quantile(vals, 0.75),
+    p90 = quantile(vals, 0.90)
+  )
+}))
+
+pct_nom <- do.call(rbind, lapply(1:n_years_max, function(t) {
+  vals <- nominal_matrix[, t]
+  vals <- vals[!is.na(vals)]
+  if (length(vals) < 10) return(NULL)
+  data.frame(age = current_age + t - 1, p50_nom = quantile(vals, 0.50))
+}))
+
+ggplot(pct_real, aes(x = age)) +
+  geom_ribbon(aes(ymin = p10, ymax = p90), fill = "steelblue", alpha = 0.15) +
+  geom_ribbon(aes(ymin = p25, ymax = p75), fill = "steelblue", alpha = 0.25) +
+  geom_line(aes(y = p50), color = "steelblue", linewidth = 1.2) +
+  geom_line(data = pct_nom, aes(x = age, y = p50_nom),
+            color = "grey50", linewidth = 0.8, linetype = "dashed") +
+  geom_vline(xintercept = retirement_age, linetype = "dashed", color = "grey40") +
+  annotate("text", x = retirement_age + 0.5, y = max(pct_real$p90, na.rm = TRUE) * 0.95,
+           label = "Retirement", hjust = 0, size = 3.5) +
+  geom_hline(yintercept = 0, color = "firebrick", linewidth = 0.5) +
+  scale_y_continuous(labels = scales::dollar_format()) +
+  labs(title = "Portfolio Value Over Time (Today's Dollars)",
+       subtitle = paste0("Blue = real (inflation-adjusted) | Dashed grey = nominal median | ",
+                         sprintf("P(ruin) = %.1f%%", prob_ruin * 100)),
+       x = "Age", y = "Portfolio Value (today's $)") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 16, face = "bold"))
+```
+
+# Terminal Wealth Distribution (Today's Dollars)
+
+```{r, fig.width=9, fig.height=5}
+terminal_real <- sapply(1:n_sims, function(i) {
+  t_death <- min(death_ages[i] - current_age, n_years_max)
+  if (t_death < 1) return(0)
+  val <- real_matrix[i, t_death]
+  ifelse(is.na(val), 0, val)
+})
+
+terminal_nom <- sapply(1:n_sims, function(i) {
+  t_death <- min(death_ages[i] - current_age, n_years_max)
+  if (t_death < 1) return(0)
+  val <- nominal_matrix[i, t_death]
+  ifelse(is.na(val), 0, val)
+})
+
+cat("=== TERMINAL WEALTH AT DEATH ===\n\n")
+cat("In today's dollars (real):\n")
+cat("  Mean:    ", scales::dollar(mean(terminal_real)), "\n")
+cat("  Median:  ", scales::dollar(median(terminal_real)), "\n")
+cat("  10th %:  ", scales::dollar(quantile(terminal_real, 0.10)), "\n")
+cat("  90th %:  ", scales::dollar(quantile(terminal_real, 0.90)), "\n\n")
+cat("In nominal dollars:\n")
+cat("  Mean:    ", scales::dollar(mean(terminal_nom)), "\n")
+cat("  Median:  ", scales::dollar(median(terminal_nom)), "\n")
+cat("  10th %:  ", scales::dollar(quantile(terminal_nom, 0.10)), "\n")
+cat("  90th %:  ", scales::dollar(quantile(terminal_nom, 0.90)), "\n")
+
+cap <- quantile(terminal_real[terminal_real > 0], 0.99, na.rm = TRUE)
+if (is.na(cap) || cap <= 0) cap <- 1
+ggplot(data.frame(w = pmin(terminal_real, cap)), aes(x = w)) +
+  geom_histogram(bins = 60, fill = "steelblue", alpha = 0.7) +
+  geom_vline(xintercept = 0, color = "firebrick", linewidth = 0.8) +
+  scale_x_continuous(labels = scales::dollar_format()) +
+  labs(title = "Distribution of Wealth at Death (Today's Dollars)",
+       subtitle = paste0("Across ", scales::comma(n_sims),
+                         " simulations | personalized mortality & stochastic inflation"),
+       x = "Portfolio Value at Death (today's $)", y = "Count") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 16, face = "bold"))
+```
+
+# Withdrawal Rate Sensitivity
+
+Spending is specified in today's dollars and grows with each path's realized inflation.
+
+```{r, fig.width=9, fig.height=6}
+spending_levels <- seq(30000, 80000, by = 5000)
+ruin_rates <- numeric(length(spending_levels))
+
+# Pre-generate paths for consistency across sensitivity tests
+all_paths <- lapply(1:n_sims, function(i) generate_paths(n_years_max))
+
+for (s in seq_along(spending_levels)) {
+  test_spending_real <- spending_levels[s]
+  test_ruin <- 0
+  
+  for (i in 1:n_sims) {
+    portfolio_nom <- current_portfolio
+    income_nom    <- current_income
+    spending_nom  <- test_spending_real
+    ss_nom        <- social_security
+    death         <- death_ages[i]
+    paths         <- all_paths[[i]]
+    ruined        <- FALSE
+    
+    for (t in 1:n_years_max) {
+      age <- current_age + t - 1
+      if (age >= death) break
+      infl <- paths$infl_r[t]
+      
+      if (age < retirement_age) {
+        contribution_nom <- income_nom * savings_rate
+        withdrawal_nom   <- 0
+        income_nom <- income_nom * (1 + infl) * (1 + real_income_growth)
+      } else {
+        ss_this_year   <- ifelse(age >= ss_start_age, ss_nom, 0)
+        withdrawal_nom <- max(spending_nom - ss_this_year, 0)
+        contribution_nom <- 0
+      }
+      
+      portfolio_nom <- portfolio_nom - withdrawal_nom
+      if (portfolio_nom <= 0) { ruined <- TRUE; break }
+      
+      r_blend <- stock_allocation * paths$stock_r[t] +
+                 (1 - stock_allocation) * paths$bond_r[t]
+      portfolio_nom <- portfolio_nom * (1 + r_blend) + contribution_nom
+      
+      spending_nom <- spending_nom * (1 + infl)
+      ss_nom       <- ss_nom * (1 + infl)
+    }
+    if (ruined) test_ruin <- test_ruin + 1
+  }
+  ruin_rates[s] <- test_ruin / n_sims
+}
+
+ruin_frontier <- data.frame(
+  annual_spending = spending_levels,
+  withdrawal_rate_pct = spending_levels / current_portfolio * 100,
+  prob_ruin = ruin_rates
+)
+
+ggplot(ruin_frontier, aes(x = annual_spending, y = prob_ruin)) +
+  geom_line(color = "firebrick", linewidth = 1.2) +
+  geom_point(color = "firebrick", size = 2) +
+  geom_hline(yintercept = 0.05, linetype = "dashed", color = "grey40") +
+  annotate("text", x = min(spending_levels), y = 0.07,
+           label = "5% ruin threshold", hjust = 0, size = 3.5, color = "grey40") +
+  geom_hline(yintercept = 0.10, linetype = "dotted", color = "grey60") +
+  annotate("text", x = min(spending_levels), y = 0.12,
+           label = "10% ruin threshold", hjust = 0, size = 3.5, color = "grey60") +
+  scale_x_continuous(labels = scales::dollar_format()) +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, NA)) +
+  labs(title = "Probability of Ruin by Annual Spending Level (Today's $)",
+       subtitle = paste0("Retirement at ", retirement_age,
+                         " | SS $", scales::comma(social_security), "/yr at age ", ss_start_age,
+                         " | ", round(stock_allocation*100), "/", round((1-stock_allocation)*100),
+                         " stocks/bonds | stochastic inflation"),
+       x = "Annual Spending (today's $)", y = "Probability of Ruin") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 16, face = "bold"))
+
+safe_5  <- ruin_frontier %>% filter(prob_ruin <= 0.05) %>% slice_max(annual_spending, n = 1)
+safe_10 <- ruin_frontier %>% filter(prob_ruin <= 0.10) %>% slice_max(annual_spending, n = 1)
+cat("\nMax annual spending at <= 5% ruin: ",
+    ifelse(nrow(safe_5) > 0, scales::dollar(safe_5$annual_spending), "none in range"), "\n")
+cat("Max annual spending at <= 10% ruin:",
+    ifelse(nrow(safe_10) > 0, scales::dollar(safe_10$annual_spending), "none in range"), "\n")
+```
+
+# Retirement Age Sensitivity
+
+```{r, fig.width=9, fig.height=6}
+ret_ages <- seq(55, 75, by = 5)
+ruin_by_ret_age <- numeric(length(ret_ages))
+
+for (r in seq_along(ret_ages)) {
+  test_ret_age <- ret_ages[r]
+  test_ruin <- 0
+  for (i in 1:n_sims) {
+    portfolio_nom <- current_portfolio
+    income_nom    <- current_income
+    spending_nom  <- annual_spending
+    ss_nom        <- social_security
+    death         <- death_ages[i]
+    paths         <- all_paths[[i]]
+    ruined        <- FALSE
+    for (t in 1:n_years_max) {
+      age <- current_age + t - 1
+      if (age >= death) break
+      infl <- paths$infl_r[t]
+      if (age < test_ret_age) {
+        contribution_nom <- income_nom * savings_rate
+        withdrawal_nom   <- 0
+        income_nom <- income_nom * (1 + infl) * (1 + real_income_growth)
+      } else {
+        ss_this_year   <- ifelse(age >= ss_start_age, ss_nom, 0)
+        withdrawal_nom <- max(spending_nom - ss_this_year, 0)
+        contribution_nom <- 0
+      }
+      portfolio_nom <- portfolio_nom - withdrawal_nom
+      if (portfolio_nom <= 0) { ruined <- TRUE; break }
+      r_blend <- stock_allocation * paths$stock_r[t] +
+                 (1 - stock_allocation) * paths$bond_r[t]
+      portfolio_nom <- portfolio_nom * (1 + r_blend) + contribution_nom
+      spending_nom <- spending_nom * (1 + infl)
+      ss_nom       <- ss_nom * (1 + infl)
+    }
+    if (ruined) test_ruin <- test_ruin + 1
+  }
+  ruin_by_ret_age[r] <- test_ruin / n_sims
+}
+
+ggplot(data.frame(ret_age = ret_ages, prob_ruin = ruin_by_ret_age),
+       aes(x = ret_age, y = prob_ruin)) +
+  geom_line(color = "darkgreen", linewidth = 1.2) +
+  geom_point(color = "darkgreen", size = 3) +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, NA)) +
+  labs(title = "Probability of Ruin by Retirement Age",
+       subtitle = paste0("Spending $", scales::comma(annual_spending),
+                         "/yr (today's $) | stochastic inflation"),
+       x = "Retirement Age", y = "Probability of Ruin") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 16, face = "bold"))
+```
+
+# Summary
+
+```{r}
+median_cum_infl <- median(sapply(1:n_sims, function(i) {
+  t_death <- min(death_ages[i] - current_age, n_years_max)
+  if (t_death < 1) return(1)
+  pl <- price_level_mat[i, t_death]
+  ifelse(is.na(pl), 1, pl)
+}))
+
+cat("============================================\n")
+cat("  RETIREMENT MONTE CARLO SIMULATION SUMMARY\n")
+cat("============================================\n\n")
+cat("Inputs:\n")
+cat("  Current age:          ", current_age, "\n")
+cat("  Retirement age:       ", retirement_age, "\n")
+cat("  Current portfolio:    ", scales::dollar(current_portfolio), "(today's $)\n")
+cat("  Current income:       ", scales::dollar(current_income), "(today's $)\n")
+cat("  Savings rate:         ", sprintf("%.0f%%", savings_rate * 100), "\n")
+cat("  Annual spending:      ", scales::dollar(annual_spending), "(today's $, grows w/ inflation)\n")
+cat("  Social Security:      ", scales::dollar(social_security), "/yr at age", ss_start_age, "(COLA)\n")
+cat("  Allocation:           ", sprintf("%.0f/%.0f stocks/bonds",
+    stock_allocation*100, (1-stock_allocation)*100), "\n\n")
+cat("Market Assumptions (NOMINAL):\n")
+cat("  Stock return:         ", sprintf("%.1f%% +/- %.1f%%", stock_mean_nom*100, stock_sd*100), "\n")
+cat("  Bond return:          ", sprintf("%.1f%% +/- %.1f%%", bond_mean_nom*100, bond_sd*100), "\n")
+cat("  Inflation:            ", sprintf("%.1f%% +/- %.1f%%", infl_mean*100, infl_sd*100), "\n")
+cat("  Stock-bond corr:      ", corr_stock_bond, "\n")
+cat("  Stock-inflation corr: ", corr_stock_infl, "\n")
+cat("  Bond-inflation corr:  ", corr_bond_infl, "\n\n")
+cat("Mortality (personalized Cox PH model):\n")
+cat("  Expected death age:   ", round(mort$expected_death_age, 1), "\n")
+cat("  Median death age:     ", round(mort$median_death_age, 1), "\n")
+cat("  Std dev:              ", round(mort$sd_death_age, 1), "years\n\n")
+cat("Results (", scales::comma(n_sims), " simulations):\n")
+cat("  Probability of ruin:      ", sprintf("%.1f%%", prob_ruin * 100), "\n")
+cat("  Median terminal (real):   ", scales::dollar(median(terminal_real)), "\n")
+cat("  Mean terminal (real):     ", scales::dollar(mean(terminal_real)), "\n")
+cat("  Median terminal (nominal):", scales::dollar(median(terminal_nom)), "\n")
+cat("  Median cumulative infl:   ", sprintf("%.1fx (%.0f%% total)",
+    median_cum_infl, (median_cum_infl-1)*100), "\n")
+if (exists("safe_5") && nrow(safe_5) > 0)
+  cat("  Max safe spend (5%):  ", scales::dollar(safe_5$annual_spending), "(today's $)\n")
+if (exists("safe_10") && nrow(safe_10) > 0)
+  cat("  Max safe spend (10%): ", scales::dollar(safe_10$annual_spending), "(today's $)\n")
+```
+
+---
+
+**Methodology notes:**
+
+- **Stochastic inflation**: Inflation is a correlated lognormal process
+  (mean `r sprintf("%.1f%%", infl_mean*100)`, SD `r sprintf("%.1f%%", infl_sd*100)`),
+  jointly drawn with stock and bond returns via a 3x3 Cholesky decomposition.
+  Each simulation path realizes its own inflation trajectory.
+- **Nominal simulation, real reporting**: Portfolio, income, spending, and Social
+  Security evolve in nominal terms. All reported statistics are deflated by each
+  path's own cumulative price level, so "today's dollars" means something different
+  for each path — correctly capturing the fact that high-inflation paths erode
+  purchasing power more.
+- **Key correlation**: Bond-inflation correlation is negative (-0.30), capturing
+  the empirical fact that surprise inflation hurts nominal bond holders. This means
+  the 70/30 portfolio faces correlated risk: high inflation simultaneously erodes
+  bond values and increases the nominal spending needed to maintain real lifestyle.
+- **Mortality** is sampled from the personalized Cox PH survival curve, not generic
+  actuarial tables. Each simulation jointly draws a death age, a market path, and
+  an inflation path.
+- Following Stout & Mitchell (2006, 2014), Milevsky & Robinson (2005), and
+  addressing the inflation-risk concerns of Pfau (2010) and Bengen (2012).
