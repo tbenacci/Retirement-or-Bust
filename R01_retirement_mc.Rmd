@@ -569,10 +569,6 @@ if (exists("safe_10") && nrow(safe_10) > 0)
   cat("  Max safe spend (10%): ", scales::dollar(safe_10$annual_spending), "(today's $)\n")
 ```
 
----
-
-**Methodology notes:**
-
 - **Stochastic inflation**: Inflation is a correlated lognormal process
   (mean `r sprintf("%.1f%%", infl_mean*100)`, SD `r sprintf("%.1f%%", infl_sd*100)`),
   jointly drawn with stock and bond returns via a 3x3 Cholesky decomposition.
@@ -591,3 +587,4 @@ if (exists("safe_10") && nrow(safe_10) > 0)
   an inflation path.
 - Following Stout & Mitchell (2006, 2014), Milevsky & Robinson (2005), and
   addressing the inflation-risk concerns of Pfau (2010) and Bengen (2012).
+
