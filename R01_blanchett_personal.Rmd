@@ -1,0 +1,1389 @@
+---
+title: "Replication: Dynamic Allocation Strategies for Distribution Portfolios"
+subtitle: "Blanchett (2007), *Journal of Financial Planning* 20(12): 66--83"
+author: "Thomas Benacci"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: hide
+    fig_width: 10
+    fig_height: 8
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 8, cache = FALSE)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(scales)
+library(MASS)
+library(parallel)
+library(doParallel)
+library(foreach)
+library(progress)
+```
+
+# Overview
+
+This notebook replicates the core methodology from:
+
+> **Blanchett, D. M. (2007).** *Dynamic Allocation Strategies for Distribution
+> Portfolios: Determining the Optimal Distribution Glide Path.* Journal of
+> Financial Planning, 20(12), 66--83.
+
+The central question of the paper is: for a retiree drawing down a portfolio, what equity glide path (the schedule of stock v. bond allocation over time) gives the best outcomes? Most financial planning assumes a fixed allocation like 60/40, but Blanchett tests whether dynamically changing the allocation over the retirement period can do better.
+
+He tests 43 distribution glide paths across 5 types (Constant, Linear, Stair, Convex, Concave). Each glide path is run against 1,071 scenarios defined by the combination of distribution period (20 to 40 years, how long the retiree lives) and withdrawal rate (3 to 8% of initial portfolio per year, in 0.1% steps, adjusted for inflation). Each scenario is simulated with 10,000 Monte Carlo trials.
+
+The paper measures two things:
+
+1. **Probability of Failure**: did the portfolio run out of money before the end of the distribution period? This is the simplest measure: lower is better.
+
+2. **Success to Variability (STV) Ratio**: probability of success divided by the portfolio's standard deviation. This is a risk-adjusted measure. A 100% stock portfolio might have the highest success rate, but it also has the highest volatility. The STV penalizes that volatility, asking: per unit of risk taken, how much success do you get?
+
+All returns in this simulation are real returns (already adjusted for inflation). The paper's Table 2 reports real historical returns from 1927 to 2006. Spending is also in real (today's) dollars. So a "4% withdrawal rate" means 4% of the initial portfolio value, with that dollar amount growing with inflation each year.
+
+# Asset Class Parameters
+
+The paper uses 4 asset classes with historical return data from 1927 to 2006 (Table 2 in the paper). The original paper bootstraps monthly returns from this period (i.e., it randomly resamples actual historical monthly returns with replacement to build simulated paths). Since we do not have access to the original monthly return series, we instead use a parametric Monte Carlo: we calibrate a multivariate lognormal distribution to match the paper's reported arithmetic means and standard deviations, then draw correlated random returns from that distribution.
+
+The key assumption here is that returns are lognormally distributed, which means log(1+R) is normally distributed. We convert the arithmetic mean returns to lognormal drift parameters using the relationship: E[R] = exp(mu + sigma^2/2) - 1.
+
+All returns are real (inflation-adjusted) and follow the paper's chosen variables.
+
+```{r asset_params}
+# Table 2 from the paper: Annualized Real Returns and Standard Deviations
+# Data period: 1927--2006 (80 years of US market history)
+#
+#                        Geometric  Arithmetic   StdDev
+# Cash                     0.72%      0.81%      4.10%
+# Intermediate-term Bond   2.34%      2.52%      6.14%
+# Domestic Large Blend Eq  7.36%      9.48%     20.99%
+# International Equity     5.16%      7.25%     21.59%
+#
+# Note: Geometric return = what you actually earned (compound).
+#       Arithmetic return = simple average of annual returns (always higher).
+#       We use arithmetic returns for the Monte Carlo because the simulation
+#       compounds them year by year -- the geometric return emerges naturally.
+#
+# Note: These are REAL returns (after inflation). Cash earned 0.81% real,
+#       meaning it barely kept up with inflation. Stocks earned 9.48% real,
+#       meaning about 9.48% above inflation. This is why we do not need to
+#       model inflation separately anywhere in this simulation.
+
+asset_names <- c("Cash", "IntBond", "DomEq", "IntlEq")
+
+# Arithmetic real returns (annual) -- from Table 2
+mu_arith <- c(0.0081, 0.0252, 0.0948, 0.0725)
+
+# Annual standard deviations -- from Table 2
+sigma    <- c(0.0410, 0.0614, 0.2099, 0.2159)
+
+# Convert arithmetic means to lognormal drift parameters.
+# If R ~ Lognormal, then log(1+R) ~ Normal(mu_log, sigma^2).
+# The relationship is: E[R] = exp(mu_log + sigma^2/2) - 1
+# Solving for mu_log: mu_log = log(1 + E[R]) - sigma^2/2
+# This ensures our random draws produce the correct expected returns.
+mu_log <- log(1 + mu_arith) - sigma^2 / 2
+
+# Correlation matrix between the 4 asset classes.
+# The paper does not report correlations explicitly. These estimates are based
+# on historical data from the same 1927-2006 period (Ibbotson/Morningstar SBBI):
+#   Cash vs Bonds: ~0.40 (both fixed income but different duration sensitivity)
+#   Cash vs Domestic Eq: ~0.02 (near zero, stocks don't track short rates)
+#   Cash vs Intl Eq: ~-0.05 (slight negative)
+#   Bonds vs Domestic Eq: ~0.05 (low positive over long horizons)
+#   Bonds vs Intl Eq: ~0.02 (negligible)
+#   Domestic vs Intl Eq: ~0.60 (correlated but not identical markets)
+cor_mat <- matrix(c(
+  1.00,  0.40,  0.02, -0.05,
+  0.40,  1.00,  0.05,  0.02,
+  0.02,  0.05,  1.00,  0.60,
+ -0.05,  0.02,  0.60,  1.00
+), 4, 4)
+
+# Build the covariance matrix from correlations and standard deviations.
+# Cov = diag(sigma) %*% Cor %*% diag(sigma)
+# This is what mvrnorm() needs to generate correlated draws.
+cov_mat <- diag(sigma) %*% cor_mat %*% diag(sigma)
+
+cat("Asset classes:", paste(asset_names, collapse = ", "), "\n")
+cat("Arithmetic real returns:", paste(sprintf("%.2f%%", mu_arith * 100), collapse = ", "), "\n")
+cat("Standard deviations:   ", paste(sprintf("%.2f%%", sigma * 100), collapse = ", "), "\n")
+```
+
+# Portfolio Construction
+
+The paper simplifies portfolio construction (p. 69) by using a single number, the equity allocation percentage, to determine all 4 asset weights. The equity portion is split 2/3 Domestic Large Blend and 1/3 International. The fixed income portion is split 50/50 between Cash and Intermediate Bond. So a "60/40 portfolio" means 40% Domestic Stock, 20% International Stock, 20% Cash, and 20% Intermediate Bond. Every portfolio in the paper is fully described by a single equity percentage, and the glide paths tested later are just schedules of how that number changes over time.
+
+We also compute the portfolio standard deviation for any given equity %, which is needed later for the STV ratio: sigma_p = sqrt(w' * Cov * w).
+
+```{r portfolio_weights}
+get_weights <- function(eq_pct) {
+  # Given an equity allocation (0 to 1), return the 4 asset weights.
+  # Example: eq_pct = 0.60 returns c(0.20, 0.20, 0.40, 0.20)
+  #          meaning 20% cash, 20% bond, 40% domestic stock, 20% intl stock
+  fi_pct <- 1 - eq_pct
+  w_cash   <- fi_pct * 0.50   # half of fixed income
+  w_bond   <- fi_pct * 0.50   # other half of fixed income
+  w_dom_eq <- eq_pct * (2/3)  # 2/3 of equity sleeve
+  w_intl   <- eq_pct * (1/3)  # 1/3 of equity sleeve
+  c(w_cash, w_bond, w_dom_eq, w_intl)
+}
+
+# Portfolio standard deviation as a function of equity %.
+# This is the annualized volatility of the blended portfolio.
+# Used later to compute the Success to Variability (STV) ratio.
+port_sd <- function(eq_pct) {
+  w <- get_weights(eq_pct)
+  as.numeric(sqrt(t(w) %*% cov_mat %*% w))
+}
+
+# Verify against paper's reported values (p. 70, Table 3 footnote):
+# 100/0 portfolio should have SD ~17.08% (pure equity)
+# 0/100 portfolio should have SD ~2.20% (pure fixed income)
+cat("Portfolio SD at 100% equity:", sprintf("%.2f%%", port_sd(1.0) * 100), "\n")
+cat("Portfolio SD at   0% equity:", sprintf("%.2f%%", port_sd(0.0) * 100), "\n")
+cat("Portfolio SD at  60% equity:", sprintf("%.2f%%", port_sd(0.6) * 100), "\n")
+```
+
+# Glide Path Definitions
+
+A glide path is a schedule that specifies the equity allocation at each year of the distribution period (the period post-retirement). For example, 60/40 Constant means hold 60% stocks and 40% bonds every year, while 100/0 Linear means start at 100% stocks and decrease by 1 percentage point per year.
+
+The paper tests 43 glide paths across 5 types (Table 3, p. 70). **Constant** (11 paths) is a static allocation that never changes, tested at every 10% step from 0/100 to 100/0. **Linear** (8 paths) decreases equity by exactly 1pp per year; starting allocations range from 30/70 to 100/0. **Stair** (8 paths) holds equity constant for 10 years then drops 10%, repeating at years 10, 20, and 30. **Concave** (8 paths) decreases equity at an increasing rate: barely changes early, drops faster and faster toward the end. The paper's end note 5 gives the exact formula: eq[t] = eq[t-1] - (t^2 * 0.00002). The total cumulative reduction over 40 years is about 44 percentage points. **Convex** (8 paths) is the mirror image of Concave: equity drops fast early and slows down late, with the same total reduction but front loaded. We compute this by generating the Concave drops and reversing their order. The naming convention is "X/Y Type" where X = starting equity % and Y = starting fixed income %.
+
+```{r glide_paths}
+max_T <- 40  # maximum distribution period tested in the paper
+
+# Generate the equity allocation vector for a given type and starting equity.
+# Returns a numeric vector of length T_years where each element is the
+# equity allocation (0 to 1) for that year of the distribution period.
+make_glidepath <- function(start_eq, type, T_years = max_T) {
+  eq <- numeric(T_years)
+  eq[1] <- start_eq
+  
+  if (type == "Constant") {
+    # Never changes. eq[t] = start_eq for all t.
+    eq[] <- start_eq
+    
+  } else if (type == "Linear") {
+    # Decrease by exactly 1 percentage point (0.01) every year.
+    # Floored at 0 -- equity cannot go negative.
+    for (t in 2:T_years) {
+      eq[t] <- max(eq[t-1] - 0.01, 0)
+    }
+    
+  } else if (type == "Stair") {
+    # Hold constant for 10 years, then drop 10pp at years 10, 20, 30, etc.
+    # Between steps, the allocation is flat.
+    for (t in 2:T_years) {
+      if (t %% 10 == 0) {
+        eq[t] <- max(eq[t-1] - 0.10, 0)
+      } else {
+        eq[t] <- eq[t-1]
+      }
+    }
+    
+  } else if (type == "Concave") {
+    # Paper endnote 5: eq[t] = eq[t-1] - (t^2 * 0.00002)
+    # The drop each year is t^2 * 0.00002, so:
+    #   Year  2: drop = 0.00008  (negligible)
+    #   Year 10: drop = 0.002    (0.2pp)
+    #   Year 20: drop = 0.008    (0.8pp)
+    #   Year 30: drop = 0.018    (1.8pp)
+    #   Year 40: drop = 0.032    (3.2pp)
+    # Total reduction over 40 years: sum(t^2 * 0.00002, t=2..40) ~ 44pp
+    # Shape: barely moves early, accelerates late. Good for retirees who
+    # want equity exposure early in retirement to fight sequence risk.
+    for (t in 2:T_years) {
+      eq[t] <- max(eq[t-1] - (t^2 * 0.00002), 0)
+    }
+    
+  } else if (type == "Convex") {
+    # The mirror image of Concave: drops fast early, slows down late.
+    # Same TOTAL reduction as Concave over the same period, but the big
+    # drops happen in years 1-10 instead of years 30-40.
+    # Implementation: generate the Concave per-year drops, reverse them.
+    concave_path <- numeric(T_years)
+    concave_path[1] <- start_eq
+    for (t in 2:T_years) {
+      concave_path[t] <- max(concave_path[t-1] - (t^2 * 0.00002), 0)
+    }
+    # Extract the per-year changes (all negative or zero)
+    drops <- diff(concave_path)  # length T_years - 1
+    # Reverse the order: the biggest drop (from year 40) now happens first
+    eq[1] <- start_eq
+    reversed_drops <- rev(drops)
+    for (t in 2:T_years) {
+      eq[t] <- max(eq[t-1] + reversed_drops[t-1], 0)
+    }
+  }
+  
+  # Safety: clamp all values to [0, 1]
+  pmin(pmax(eq, 0), 1)
+}
+
+# Build all 43 glide paths (Table 3 in the paper)
+gp_list <- list()
+
+# 11 Constant paths: 0/100, 10/90, 20/80, ..., 100/0
+for (eq in seq(0, 1, by = 0.10)) {
+  name <- sprintf("%.0f/%.0f Constant", eq*100, (1-eq)*100)
+  gp_list[[name]] <- list(
+    name = name, type = "Constant", start_eq = eq,
+    path = make_glidepath(eq, "Constant")
+  )
+}
+
+# 8 Dynamic paths for each of the 4 dynamic types.
+# Starting allocations: 30/70, 40/60, 50/50, 60/40, 70/30, 80/20, 90/10, 100/0
+# (The paper does not test dynamic paths starting below 30% equity because
+# the reductions would bring equity to 0 almost immediately.)
+dynamic_starts <- seq(0.30, 1.0, by = 0.10)
+for (type in c("Linear", "Stair", "Convex", "Concave")) {
+  for (eq in dynamic_starts) {
+    name <- sprintf("%.0f/%.0f %s", eq*100, (1-eq)*100, type)
+    gp_list[[name]] <- list(
+      name = name, type = type, start_eq = eq,
+      path = make_glidepath(eq, type)
+    )
+  }
+}
+
+cat("Total glide paths defined:", length(gp_list), "\n")
+cat("  Constant:", sum(sapply(gp_list, function(x) x$type == "Constant")), "\n")
+cat("  Linear:  ", sum(sapply(gp_list, function(x) x$type == "Linear")), "\n")
+cat("  Stair:   ", sum(sapply(gp_list, function(x) x$type == "Stair")), "\n")
+cat("  Convex:  ", sum(sapply(gp_list, function(x) x$type == "Convex")), "\n")
+cat("  Concave: ", sum(sapply(gp_list, function(x) x$type == "Concave")), "\n")
+```
+
+## Visualize Glide Paths (Figure 3)
+
+```{r fig3_glidepaths, fig.height=7}
+gp_plot_df <- bind_rows(lapply(gp_list, function(gp) {
+  data.frame(name = gp$name, type = gp$type, year = 1:max_T, equity = gp$path)
+}))
+
+ggplot(gp_plot_df, aes(x = year, y = equity, color = name)) +
+  geom_line(alpha = 0.7, linewidth = 0.6) +
+  facet_wrap(~type, ncol = 3) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 1)) +
+  labs(title = "Figure 3: Distribution Glide Paths Tested (43 total)",
+       subtitle = "Blanchett (2007)",
+       x = "Distribution Period (Years)", y = "Equity Allocation") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+```
+
+# Monte Carlo Simulation Engine
+
+For each glide path and each scenario (combination of distribution period and withdrawal rate), we run 10,000 simulated retirements and count how many end in failure (portfolio hits zero before the period ends). Each simulation starts with a portfolio of $100 (normalized; the actual amount does not matter because the withdrawal rate is a percentage). At the start of each year, the annual spending amount is withdrawn, then the portfolio earns the blended return for that year based on the glide path's equity allocation. If the portfolio hits zero, that simulation is marked as failed. After 10,000 runs, P(failure) = number depleted / 10,000.
+
+Instead of running the simulation separately for each of the 51 withdrawal rates (3.0% to 8.0%), we run them all at once. The portfolio returns are identical across withdrawal rates because they depend only on the glide path and the random draws. Only the spending amount differs. We use a matrix where each column is a different withdrawal rate and the portfolio return is applied identically to all columns.
+
+```{r sim_engine}
+n_sims <- 10000  # 10,000 simulations per scenario, matching the paper
+set.seed(42)     # reproducibility
+
+# Pre-generate ALL random returns upfront.
+# We need n_sims paths, each max_T years long, for 4 asset classes.
+# Drawing from the multivariate lognormal: log(1+R) ~ MVN(mu_log, cov_mat)
+# Then R = exp(log(1+R)) - 1 converts back to simple returns.
+total_draws <- n_sims * max_T
+z_all <- mvrnorm(n = total_draws, mu = mu_log, Sigma = cov_mat)
+r_all <- exp(z_all) - 1  # convert from log-returns to simple returns
+
+# Reshape into matrices: rows = simulations, columns = years
+# r_cash[i, t] = the cash return in simulation i, year t
+r_cash   <- matrix(r_all[, 1], nrow = n_sims, ncol = max_T)
+r_bond   <- matrix(r_all[, 2], nrow = n_sims, ncol = max_T)
+r_dom_eq <- matrix(r_all[, 3], nrow = n_sims, ncol = max_T)
+r_intl   <- matrix(r_all[, 4], nrow = n_sims, ncol = max_T)
+
+# -- Vectorized simulation: all withdrawal rates at once
+# For a given glide path and distribution period, this function simulates
+# all n_sims paths for ALL withdrawal rates simultaneously.
+#
+# Inputs:
+#   gp_path: equity allocation vector (length >= T_years)
+#   wr_vec:  vector of withdrawal rates to test (e.g., seq(0.03, 0.08, 0.001))
+#   T_years: how many years the retirement lasts
+#   r_cash, r_bond, r_dom_eq, r_intl: pre-generated return matrices
+#   n_sims:  number of simulations
+#
+# Returns: vector of P(failure) for each withdrawal rate
+sim_gp_fast <- function(gp_path, wr_vec, T_years,
+                         r_cash, r_bond, r_dom_eq, r_intl, n_sims) {
+  n_wr <- length(wr_vec)
+  spend_vec <- wr_vec * 100  # spending per year (portfolio starts at $100)
+  
+  # wealth[i, k] = wealth of simulation i under withdrawal rate k
+  # All start at $100
+  wealth   <- matrix(100, nrow = n_sims, ncol = n_wr)
+  depleted <- matrix(FALSE, nrow = n_sims, ncol = n_wr)
+  
+  for (t in 1:T_years) {
+    # 1. Look up the equity allocation for this year from the glide path
+    eq <- gp_path[t]
+    fi <- 1 - eq
+    
+    # 2. Compute the blended portfolio return for all n_sims paths.
+    #    This is the same regardless of withdrawal rate -- only the
+    #    allocation matters, and it is the same for all WR columns.
+    port_r <- (fi * 0.5) * r_cash[, t] + (fi * 0.5) * r_bond[, t] +
+              (eq * 2/3) * r_dom_eq[, t] + (eq * 1/3) * r_intl[, t]
+    
+    # 3. Subtract annual spending (different for each WR column).
+    #    rep(spend_vec, each = n_sims) broadcasts the spend amounts
+    #    so each column gets its own WR amount subtracted.
+    wealth <- wealth - rep(spend_vec, each = n_sims)
+    
+    # 4. Mark newly depleted paths (wealth hit zero or below)
+    new_dep <- !depleted & (wealth <= 0)
+    depleted <- depleted | new_dep
+    wealth[depleted] <- 0  # once depleted, stays at zero
+    
+    # 5. Apply portfolio return to surviving paths.
+    #    growth is a vector of length n_sims, recycled across WR columns.
+    growth <- 1 + port_r
+    wealth <- wealth * growth
+    wealth[depleted] <- 0  # depleted paths stay at zero
+  }
+  
+  # P(failure) for each withdrawal rate = fraction of sims that depleted
+  colMeans(depleted)
+}
+```
+
+# Run All 1,071 Glide Path - Period - WR Scenarios
+
+The paper tests every combination of distribution period (20 to 40 years, 21 values) and withdrawal rate (3.0% to 8.0% in 0.1% steps, 51 values), giving 21 x 51 = 1,071 scenarios per glide path and 43 x 1,071 = 46,053 simulation runs total, each with 10,000 Monte Carlo paths. Results are stored as a list of matrices, one per glide path, where rows are distribution periods and columns are withdrawal rates, with values being P(failure). The simulation is parallelized across glide paths using all available CPU cores (19 on my machine) and takes ~1 minute.
+
+```{r run_all, cache=TRUE}
+# The scenario grid
+dist_periods <- 20:40                      # 21 distribution periods
+wr_rates     <- seq(0.03, 0.08, by = 0.001) # 51 withdrawal rates
+
+n_gp     <- length(gp_list)
+n_periods <- length(dist_periods)
+n_wr      <- length(wr_rates)
+total_combos <- n_gp * n_periods  # 43 x 21 = 903 (each combo does all 51 WRs at once)
+
+cat(sprintf("Glide paths: %d | Periods: %d | WR levels: %d\n", n_gp, n_periods, n_wr))
+cat(sprintf("Total scenario combos: %d x %d = %s\n", n_gp, n_periods * n_wr,
+            format(n_gp * n_periods * n_wr, big.mark = ",")))
+cat(sprintf("Vectorized combos (glide path x period): %d\n", total_combos))
+
+# -- Detect cores
+n_cores <- max(detectCores() - 1, 1)
+cat(sprintf("Using %d parallel workers\n", n_cores))
+
+# -- Worker function: process ONE glide path (all periods x all WRs)
+process_one_gp <- function(gp, dist_periods, wr_rates,
+                            r_cash, r_bond, r_dom_eq, r_intl, n_sims) {
+  mat <- matrix(NA, length(dist_periods), length(wr_rates))
+  rownames(mat) <- dist_periods
+  colnames(mat) <- wr_rates
+  
+  for (i in seq_along(dist_periods)) {
+    T_yr <- dist_periods[i]
+    mat[i, ] <- sim_gp_fast(gp$path, wr_rates, T_yr,
+                             r_cash, r_bond, r_dom_eq, r_intl, n_sims)
+  }
+  mat
+}
+
+t0 <- Sys.time()
+
+# -- Run in parallel
+cl <- makeCluster(n_cores)
+registerDoParallel(cl)
+
+# Export necessary objects to workers
+clusterExport(cl, c("sim_gp_fast", "r_cash", "r_bond", "r_dom_eq", "r_intl",
+                     "n_sims", "dist_periods", "wr_rates", "max_T"))
+
+results <- list()
+
+# Use foreach for parallel execution with progress tracking
+cat("Running simulations...\n")
+
+results <- foreach(
+  gp_idx = seq_along(gp_list),
+  .combine = function(...) list(...),
+  .multicombine = TRUE,
+  .packages = c()
+) %dopar% {
+  gp <- gp_list[[gp_idx]]
+  mat <- matrix(NA, length(dist_periods), length(wr_rates))
+  rownames(mat) <- dist_periods
+  colnames(mat) <- wr_rates
+  
+  for (i in seq_along(dist_periods)) {
+    T_yr <- dist_periods[i]
+    mat[i, ] <- sim_gp_fast(gp$path, wr_rates, T_yr,
+                             r_cash, r_bond, r_dom_eq, r_intl, n_sims)
+  }
+  mat
+}
+
+stopCluster(cl)
+
+# Name the results
+names(results) <- names(gp_list)
+
+elapsed <- as.numeric(difftime(Sys.time(), t0, units = "mins"))
+cat(sprintf("Done: Done in %.1f minutes using %d cores.\n", elapsed, n_cores))
+cat(sprintf("  Speed: %.0f scenario-combos/second\n", 
+            total_combos / as.numeric(difftime(Sys.time(), t0, units = "secs"))))
+
+# -- Console progress bar for interactive use
+# (foreach doesn't support progress bars natively across workers,
+#  so we also provide a sequential fallback with a progress bar)
+if (FALSE) {  # Set to TRUE to run sequential with progress bar instead
+  pb <- progress_bar$new(
+    format = "  :what [:bar] :current/:total (:percent) eta: :eta",
+    total = n_gp, clear = FALSE, width = 70
+  )
+  
+  results <- list()
+  t0 <- Sys.time()
+  
+  for (gp_idx in seq_along(gp_list)) {
+    gp_name <- names(gp_list)[gp_idx]
+    gp <- gp_list[[gp_idx]]
+    pb$tick(tokens = list(what = sprintf("%-20s", gp_name)))
+    
+    mat <- matrix(NA, length(dist_periods), length(wr_rates))
+    rownames(mat) <- dist_periods
+    colnames(mat) <- wr_rates
+    
+    for (i in seq_along(dist_periods)) {
+      T_yr <- dist_periods[i]
+      mat[i, ] <- sim_gp_fast(gp$path, wr_rates, T_yr,
+                               r_cash, r_bond, r_dom_eq, r_intl, n_sims)
+    }
+    results[[gp_name]] <- mat
+  }
+  
+  elapsed <- as.numeric(difftime(Sys.time(), t0, units = "mins"))
+  cat(sprintf("\nDone: Sequential run done in %.1f minutes.\n", elapsed))
+}
+```
+
+# Table 4: Probabilities of Failure for Select Scenarios
+
+Table 4 in the paper reports P(failure) for all 43 glide paths across 9 key scenarios: withdrawal rates of 4%, 5%, and 6% crossed with distribution periods of 20, 30, and 40 years. **NOTE**: Our failure rates will not match the paper exactly because the paper bootstraps actual monthly returns from 1927 to 2006, which embeds the true historical correlation structure, fat tails, and serial dependence. We instead draw from a parametric multivariate lognormal with an assumed correlation matrix, so any mismatch in those assumptions flows directly into the portfolio return distribution. The qualitative findings should still replicate.
+
+```{r table4}
+# Select scenarios matching paper's Table 4
+table4_scenarios <- list(
+  c(0.04, 20), c(0.04, 30), c(0.04, 40),
+  c(0.05, 20), c(0.05, 30), c(0.05, 40),
+  c(0.06, 20), c(0.06, 30), c(0.06, 40)
+)
+
+table4_df <- bind_rows(lapply(table4_scenarios, function(sc) {
+  wr <- sc[1]; T_yr <- sc[2]
+  wr_key <- as.character(wr)
+  T_key  <- as.character(T_yr)
+  
+  data.frame(
+    glidepath = names(results),
+    wr = wr,
+    period = T_yr,
+    p_fail = sapply(results, function(mat) {
+      mat[T_key, wr_key]
+    }),
+    stringsAsFactors = FALSE
+  )
+}))
+
+# Pivot for display
+table4_wide <- table4_df %>%
+  mutate(scenario = sprintf("WR=%.0f%% T=%d", wr*100, period)) %>%
+  dplyr::select(glidepath, scenario, p_fail) %>%
+  pivot_wider(names_from = scenario, values_from = p_fail)
+
+# Find best/worst for each scenario
+for (sc_col in names(table4_wide)[-1]) {
+  vals <- table4_wide[[sc_col]]
+  cat(sprintf("\n%s: Best = %s (%.2f%%), Worst = %s (%.2f%%)\n",
+              sc_col,
+              table4_wide$glidepath[which.min(vals)], min(vals) * 100,
+              table4_wide$glidepath[which.max(vals)], max(vals) * 100))
+}
+
+cat("\n\nTable 4: Probabilities of Failure for Selected Scenarios\n")
+cat(paste(rep("-", 80), collapse = ""), "\n")
+cat(sprintf("%-25s", "Glide Path"))
+for (sc_col in names(table4_wide)[-1]) cat(sprintf("%12s", sc_col))
+cat("\n")
+cat(paste(rep("-", 80), collapse = ""), "\n")
+for (i in 1:nrow(table4_wide)) {
+  cat(sprintf("%-25s", table4_wide$glidepath[i]))
+  for (sc_col in names(table4_wide)[-1]) {
+    cat(sprintf("%11.2f%%", table4_wide[[sc_col]][i] * 100))
+  }
+  cat("\n")
+}
+cat(paste(rep("-", 80), collapse = ""), "\n")
+```
+
+# Figure 1: Max Real Withdrawal Rates (5% Failure)
+
+For each Constant (static) portfolio and distribution period, we find the maximum withdrawal rate that keeps P(failure) at or below 5%. This replicates Figure 1 from the paper (p. 70).
+
+```{r fig1, fig.height=7}
+# For each Constant portfolio and distribution period, find max WR at <= 5% failure
+constant_names <- grep("Constant", names(results), value = TRUE)
+
+fig1_df <- bind_rows(lapply(constant_names, function(gp_name) {
+  mat <- results[[gp_name]]
+  bind_rows(lapply(as.character(dist_periods), function(T_key) {
+    fails <- mat[T_key, ]
+    # Find highest WR where failure <= 5%
+    valid <- which(fails <= 0.05)
+    max_wr <- if (length(valid) > 0) max(wr_rates[valid]) else NA
+    data.frame(glidepath = gp_name, period = as.integer(T_key), max_wr = max_wr)
+  }))
+}))
+
+fig1_df <- fig1_df %>%
+  mutate(eq_pct = as.numeric(gsub("/.*", "", glidepath)) / 100,
+         max_wr_label = ifelse(is.na(max_wr), "<3%", sprintf("%.1f", max_wr * 100)),
+         max_wr_fill  = ifelse(is.na(max_wr), min(wr_rates), max_wr))
+
+ggplot(fig1_df, aes(x = eq_pct, y = period, fill = max_wr_fill)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_text(aes(label = max_wr_label), 
+            color = "white", size = 2.5, fontface = "bold") +
+  scale_fill_gradient(low = "#8B0000", high = "#228B22",
+                      labels = percent_format()) +
+  scale_x_continuous(breaks = seq(0, 1, 0.1), labels = percent_format()) +
+  labs(title = "Figure 1: Maximum Real Withdrawal Rates with 5% Probability of Failure",
+       subtitle = "Constant (static) allocation portfolios only",
+       x = "Equity Allocation", y = "Distribution Period (Years)", 
+       fill = "Max WR") +
+  theme_minimal(base_size = 13)
+```
+
+Example: For a 5% probability of failure, a 60/40 portfolio with a 30-year distribution period has a 3.6% maximum withdrawal rate. 
+
+# Figure 2: Max Real Withdrawal Rates (20% Failure)
+
+```{r fig2, fig.height=7}
+fig2_df <- bind_rows(lapply(constant_names, function(gp_name) {
+  mat <- results[[gp_name]]
+  bind_rows(lapply(as.character(dist_periods), function(T_key) {
+    fails <- mat[T_key, ]
+    valid <- which(fails <= 0.20)
+    max_wr <- if (length(valid) > 0) max(wr_rates[valid]) else NA
+    data.frame(glidepath = gp_name, period = as.integer(T_key), max_wr = max_wr)
+  }))
+}))
+
+fig2_df <- fig2_df %>%
+  mutate(eq_pct = as.numeric(gsub("/.*", "", glidepath)) / 100,
+         max_wr_label = ifelse(is.na(max_wr), "<3%", sprintf("%.1f", max_wr * 100)),
+         max_wr_fill  = ifelse(is.na(max_wr), min(wr_rates), max_wr))
+
+ggplot(fig2_df, aes(x = eq_pct, y = period, fill = max_wr_fill)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_text(aes(label = max_wr_label),
+            color = "white", size = 2.5, fontface = "bold") +
+  scale_fill_gradient(low = "#8B0000", high = "#228B22",
+                      labels = percent_format()) +
+  scale_x_continuous(breaks = seq(0, 1, 0.1), labels = percent_format()) +
+  labs(title = "Figure 2: Maximum Real Withdrawal Rates with 20% Probability of Failure",
+       subtitle = "Constant (static) allocation portfolios only",
+       x = "Equity Allocation", y = "Distribution Period (Years)",
+       fill = "Max WR") +
+  theme_minimal(base_size = 13)
+```
+
+Example: When the maximum probability of failure increases from 5% to 20%, the maximum real withdrawal rate from a 60/40 portfolio with a 30-year distribution increases from 3.6% to 4.7%. 
+
+# Figure 4: Best Glide Path by Scenario (Lowest Failure)
+
+For each of the 1,071 scenarios, we look across all 43 glide paths and find which one has the lowest probability of failure. The paper finds that Constant (static) portfolios dominate, especially 100/0 (all equity) for the majority of scenarios. This makes sense: higher equity means higher expected returns and therefore a higher chance of not running out of money. The catch, addressed later with the STV ratio, is that higher equity also means higher volatility.
+
+```{r fig4, fig.height=7}
+# For each (period, wr) find the best glide path
+best_gp_df <- expand.grid(period = dist_periods, wr = wr_rates) %>%
+  rowwise() %>%
+  mutate(
+    best_gp = {
+      T_key <- as.character(period)
+      wr_key <- as.character(wr)
+      fails <- sapply(results, function(mat) mat[T_key, wr_key])
+      names(which.min(fails))[1]
+    },
+    min_fail = {
+      T_key <- as.character(period)
+      wr_key <- as.character(wr)
+      fails <- sapply(results, function(mat) mat[T_key, wr_key])
+      min(fails)
+    }
+  ) %>%
+  ungroup()
+
+# Count frequency of each optimal glide path
+best_counts <- best_gp_df %>% count(best_gp, sort = TRUE) %>%
+  mutate(pct = n / sum(n) * 100)
+
+cat("Best glide paths across all 1,071 scenarios:\n")
+print(best_counts %>% head(15))
+
+# Simplify for plotting: extract the type
+best_gp_df <- best_gp_df %>%
+  mutate(best_type = case_when(
+    grepl("Constant", best_gp) ~ "Constant",
+    grepl("Linear", best_gp) ~ "Linear",
+    grepl("Stair", best_gp) ~ "Stair",
+    grepl("Convex", best_gp) ~ "Convex",
+    grepl("Concave", best_gp) ~ "Concave"
+  ))
+
+ggplot(best_gp_df, aes(x = period, y = wr * 100, fill = best_gp)) +
+  geom_tile() +
+  scale_y_continuous(breaks = seq(3, 8, 0.5)) +
+  labs(title = "Figure 4: Optimal Glide Path for Each Scenario",
+       subtitle = "Based on lowest probability of failure among 43 glide paths",
+       x = "Distribution Period (Years)", y = "Real Withdrawal Rate (%)",
+       fill = "Optimal\nGlide Path") +
+  theme_minimal(base_size = 13) +
+  theme(legend.text = element_text(size = 7),
+        legend.key.size = unit(0.4, "cm"))
+```
+
+Example: For real WR >= 6.75% and distribution periods >= 25 years, the 100/0 Constant is the exclusive optimal glide path when only considering p(failure).
+
+# Figure 5: Best Glide Path Excluding Constant Portfolios
+
+```{r fig5, fig.height=7}
+dynamic_names <- setdiff(names(results), constant_names)
+
+best_dynamic_df <- expand.grid(period = dist_periods, wr = wr_rates) %>%
+  rowwise() %>%
+  mutate(
+    best_gp = {
+      T_key <- as.character(period)
+      wr_key <- as.character(wr)
+      fails <- sapply(results[dynamic_names], function(mat) mat[T_key, wr_key])
+      names(which.min(fails))[1]
+    }
+  ) %>%
+  ungroup()
+
+best_dyn_counts <- best_dynamic_df %>% count(best_gp, sort = TRUE) %>%
+  mutate(pct = n / sum(n) * 100)
+
+cat("Best non-Constant glide paths:\n")
+print(best_dyn_counts %>% head(15))
+
+# Summarize by type
+best_dynamic_df <- best_dynamic_df %>%
+  mutate(best_type = case_when(
+    grepl("Concave", best_gp) ~ "Concave",
+    grepl("Convex", best_gp) ~ "Convex",
+    grepl("Stair", best_gp) ~ "Stair",
+    grepl("Linear", best_gp) ~ "Linear"
+  ))
+
+type_pcts <- best_dynamic_df %>% count(best_type) %>% mutate(pct = n / sum(n) * 100)
+cat("\nBy methodology:\n")
+print(type_pcts)
+
+ggplot(best_dynamic_df, aes(x = period, y = wr * 100, fill = best_gp)) +
+  geom_tile() +
+  scale_y_continuous(breaks = seq(3, 8, 0.5)) +
+  labs(title = "Figure 5: Best Non-Constant Glide Paths",
+       subtitle = "Excluding Constant portfolios, Concave methodology dominates",
+       x = "Distribution Period (Years)", y = "Real Withdrawal Rate (%)",
+       fill = "Optimal\nGlide Path") +
+  theme_minimal(base_size = 13) +
+  theme(legend.text = element_text(size = 7),
+        legend.key.size = unit(0.4, "cm"))
+```
+
+As expected, glide paths with higher equity allocations for longer periods of time are preferred for longer distribution periods and greater real withdrawal rates. 
+
+# Success to Variability Ratio (Figure 6 & Table 5)
+
+The pure probability of success criterion almost always picks 100% equity because stocks have the highest expected return. But a retiree holding 100% stocks faces extreme volatility. The Success to Variability (STV) ratio is Blanchett's risk adjusted alternative (p. 75). It divides probability of success by portfolio standard deviation:
+
+$$STV = \frac{P(\text{Success})}{\sigma_{\text{portfolio}}}$$
+
+A 100% stock portfolio might have 95% success but 17% volatility, giving STV = 5.6. A 30/70 portfolio might have 85% success with only 5% volatility, giving STV = 17. The 30/70 is far more efficient per unit of risk. This is only computed for Constant (static) portfolios because dynamic paths have time varying standard deviations, making a single SD number misleading.
+
+```{r stv_ratio, fig.height=7}
+# Compute portfolio SD for each Constant path
+port_sds <- unname(sapply(seq(0, 1, by = 0.10), port_sd))
+names(port_sds) <- sprintf("%.0f/%.0f Constant", seq(0,100,10), seq(100,0,-10))
+
+# For each scenario, find the Constant portfolio with highest STV
+stv_df <- expand.grid(period = dist_periods, wr = wr_rates) %>%
+  rowwise() %>%
+  mutate(
+    best_stv_gp = {
+      T_key <- as.character(period)
+      wr_key <- as.character(wr)
+      stvs <- sapply(constant_names, function(gp_name) {
+        p_success <- 1 - results[[gp_name]][T_key, wr_key]
+        sd_port <- unname(port_sds[gp_name])
+        p_success / sd_port
+      })
+      names(which.max(stvs))[1]
+    }
+  ) %>%
+  ungroup()
+
+stv_counts <- stv_df %>% count(best_stv_gp, sort = TRUE) %>%
+  mutate(pct = n / sum(n) * 100)
+
+cat("Best Constant glide paths by STV ratio:\n")
+print(stv_counts)
+
+ggplot(stv_df, aes(x = period, y = wr * 100, fill = best_stv_gp)) +
+  geom_tile() +
+  scale_y_continuous(breaks = seq(3, 8, 0.5)) +
+  labs(title = "Figure 6: Best Constant Glide Paths by Success to Variability Ratio",
+       subtitle = "Less aggressive portfolios become much more efficient on a risk-adjusted basis",
+       x = "Distribution Period (Years)", y = "Real Withdrawal Rate (%)",
+       fill = "Optimal\nGlide Path") +
+  theme_minimal(base_size = 13) +
+  theme(legend.text = element_text(size = 8))
+```
+
+When comparing Figure 6 to Figure 4, the choice of optimal glide path is much more distributed and less emphasis is placed on purely aggressive portfolios that exhibit potentially unsavory amounts of volatility.
+
+## Table 5: Probability of Success v. STV Comparison
+
+```{r table5}
+# Count how often each Constant path is optimal under each criterion
+table5 <- data.frame(
+  glidepath = constant_names,
+  sd_port = sprintf("%.2f%%", port_sds[constant_names] * 100),
+  stringsAsFactors = FALSE
+)
+
+# Pure probability of success: how often is this path the best among Constants?
+prob_counts <- best_gp_df %>%
+  filter(best_gp %in% constant_names) %>%
+  count(best_gp) %>%
+  rename(glidepath = best_gp, n_prob = n)
+
+stv_counts2 <- stv_df %>%
+  count(best_stv_gp) %>%
+  transmute(glidepath = best_stv_gp, n_stv = n)
+
+table5 <- table5 %>%
+  left_join(prob_counts, by = "glidepath") %>%
+  left_join(stv_counts2, by = "glidepath") %>%
+  mutate(
+    n_prob = replace_na(n_prob, 0),
+    n_stv  = replace_na(n_stv, 0),
+    pct_prob = sprintf("%.1f%%", n_prob / 1071 * 100),
+    pct_stv  = sprintf("%.1f%%", n_stv / 1071 * 100)
+  ) %>%
+  dplyr::select(glidepath, sd_port, n_prob, pct_prob, n_stv, pct_stv)
+
+cat("\nTable 5: Pure Probability of Success v. STV Ratio: Optimal Portfolio\n")
+cat(paste(rep("-", 75), collapse = ""), "\n")
+cat(sprintf("%-20s %10s %8s %8s %8s %8s\n", "Glide Path", "Port StDev", "# Prob", "% Prob", "# STV", "% STV"))
+cat(paste(rep("-", 75), collapse = ""), "\n")
+for (i in 1:nrow(table5)) {
+  cat(sprintf("%-20s %10s %8d %8s %8d %8s\n",
+              table5$glidepath[i], table5$sd_port[i],
+              table5$n_prob[i], table5$pct_prob[i],
+              table5$n_stv[i], table5$pct_stv[i]))
+}
+cat(paste(rep("-", 75), collapse = ""), "\n")
+```
+
+In the paper, the STV ratio shifts the optimal portfolio dramatically toward conservative allocations, with 10/90 and 20/80 dominating the majority of scenarios and 100/0 almost never appearing as optimal. Our results show the same qualitative pattern: 100/0 drops from 47% of scenarios under pure probability to just 2% under STV, and 10/90 rises to the most frequently optimal at 20%, confirming that adjusting for volatility strongly penalizes equity heavy portfolios.
+
+# Probability of Ruin Heatmaps
+
+Heat-maps of P(failure) across all 1,071 scenarios for four representative constant portfolios: 0/100 (all bonds), 40/60, 60/40, and 100/0 (all equity).
+
+```{r ruin_heatmaps, fig.height=6}
+# Show heat-maps for 4 key portfolios
+key_gps <- c("0/100 Constant", "40/60 Constant", "60/40 Constant", "100/0 Constant")
+
+for (gp_name in key_gps) {
+  mat <- results[[gp_name]]
+  hm_df <- expand.grid(period = dist_periods, wr = wr_rates) %>%
+    mutate(p_fail = sapply(1:n(), function(i) mat[as.character(period[i]), 
+                                                    as.character(wr[i])]))
+  
+  p <- ggplot(hm_df, aes(x = period, y = wr * 100, fill = p_fail)) +
+    geom_tile() +
+    scale_fill_gradient2(low = "#228B22", mid = "#FFD700", high = "#8B0000",
+                         midpoint = 0.25, labels = percent_format(),
+                         limits = c(0, 1)) +
+    labs(title = sprintf("P(Failure): %s", gp_name),
+         x = "Distribution Period (Years)", y = "Real Withdrawal Rate (%)",
+         fill = "P(Fail)") +
+    theme_minimal(base_size = 13)
+  
+  print(p)
+}
+```
+
+# Probability of Bequest
+
+This extends beyond the original paper. The paper only asks whether the portfolio survived, not how much was left over. Here we compute the probability of leaving a positive real bequest (terminal wealth > 0) for each Constant portfolio at a 4% withdrawal rate across distribution periods of 20, 25, 30, 35, and 40 years. Two portfolios might both have a 5% failure rate, but one could leave a median bequest of `$`500k while the other leaves `$`50k. We run a separate simulation for this since the pre computed results matrix only stores P(failure).
+
+```{r bequest, fig.height=6}
+bequest_df <- bind_rows(lapply(constant_names, function(gp_name) {
+  gp <- gp_list[[gp_name]]
+  eq <- gp$start_eq
+  w <- get_weights(eq)
+  
+  bind_rows(lapply(c(20, 25, 30, 35, 40), function(T_yr) {
+    wealth <- rep(100, n_sims)
+    spend <- 0.04 * 100
+    depleted <- rep(FALSE, n_sims)
+    
+    for (t in 1:T_yr) {
+      wealth[!depleted] <- wealth[!depleted] - spend
+      new_dep <- !depleted & (wealth <= 0)
+      depleted[new_dep] <- TRUE
+      wealth[depleted] <- 0
+      port_r <- w[1]*r_cash[,t] + w[2]*r_bond[,t] + w[3]*r_dom_eq[,t] + w[4]*r_intl[,t]
+      wealth[!depleted] <- wealth[!depleted] * (1 + port_r[!depleted])
+    }
+    
+    data.frame(
+      glidepath = gp_name,
+      eq_pct = eq,
+      period = T_yr,
+      p_bequest = mean(wealth > 0),
+      median_wealth = median(wealth)
+    )
+  }))
+}))
+
+ggplot(bequest_df, aes(x = eq_pct * 100, y = p_bequest * 100, color = factor(period))) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2.5) +
+  scale_x_continuous(breaks = seq(0, 100, 10)) +
+  labs(title = "P(Positive Bequest) by Equity Allocation, 4% Withdrawal Rate",
+       subtitle = "Extension: Probability of leaving any remaining wealth",
+       x = "Equity Allocation (%)", y = "P(Bequest > 0) %",
+       color = "Distribution\nPeriod") +
+  theme_minimal(base_size = 14)
+```
+
+From this plot, it would follow that having better information on how long the distribution period will last would improve the choice of equity allocation leading to favorable bequest results. In the personalized retirement plan section, a P(Death) CDF derived from a Cox Proportional Hazard (PH) model is incorporated with a questionnaire of income, savings, and retirement questions to determine an appropriate glide path. 
+
+# Key Findings Summary
+
+```{r summary}
+cat("============================================================\n")
+cat("         KEY FINDINGS: Blanchett (2007) Replication         \n")
+cat("============================================================\n\n")
+
+# 1. Best overall portfolio (pure probability)
+overall_best <- best_gp_df %>% count(best_gp, sort = TRUE) %>% slice(1)
+cat("1. MOST COMMON OPTIMAL GLIDE PATH (pure P(success)):\n")
+cat("   ", overall_best$best_gp, ", ", 
+    sprintf("%.1f%%", overall_best$n / 1071 * 100), "of scenarios\n\n")
+
+# 2. Best by STV
+stv_best <- stv_counts %>% slice(1)
+cat("2. MOST COMMON OPTIMAL (STV ratio, risk-adjusted):\n")
+cat("   ", stv_best$best_stv_gp, ", ", 
+    sprintf("%.1f%%", stv_best$pct), "of scenarios\n\n")
+
+# 3. Concave dominance among dynamic paths
+concave_pct <- type_pcts %>% filter(best_type == "Concave") %>% pull(pct)
+cat("3. CONCAVE METHOD DOMINANCE (excl. Constant):\n")
+cat("   ", sprintf("%.1f%%", concave_pct), "of non-Constant optimal paths\n\n")
+
+# 4. Sample failure rates for 60/40 Constant, 4% WR
+f_60_40_30 <- results[["60/40 Constant"]]["30", "0.04"]
+cat("4. SAMPLE RESULT, 60/40 Constant, 4% WR, 30 years:\n")
+cat("    P(failure) =", sprintf("%.2f%%", f_60_40_30 * 100), "\n\n")
+
+cat("5. PAPER'S MAIN CONCLUSION:\n")
+cat("   A balanced static allocation (e.g. 60/40) is likely one of the\n")
+cat("   most efficient portfolio allocations for retirees, balancing\n")
+cat("   probability of success with portfolio variability.\n")
+```
+
+
+# Personalized Retirement Plan
+
+This section extends Blanchett's framework with your inputs. It uses a personalized mortality CDF (from a Cox PH survival model) combined with a financial situation to discover the optimal lifetime equity glide path.
+
+## Questionnaire
+
+### Where is your mortality prediction file?
+
+```{r q_mortality}
+mortality_path <- "F:/PredictingMortality/mc_mortality_input.rds"
+```
+
+### When do you plan to retire?
+
+```{r q_retirement}
+my_retirement_age <- 65
+```
+
+### What is your current financial situation?
+
+```{r q_finances}
+my_current_savings <- 100000   # total investable assets (today's $)
+my_current_income  <- 85000    # gross annual income (today's $)
+my_savings_rate    <- 0.12     # fraction of gross income saved each year
+my_real_income_growth <- 0.01  # expected real income growth per year
+```
+
+### What do you expect to spend in retirement?
+
+```{r q_spending}
+my_annual_spending <- 80000    # desired annual spending in retirement (today's $)
+```
+
+### What Social Security benefits do you expect?
+
+```{r q_social_security}
+my_ss_benefit   <- 24000    # annual SS benefit (today's $)
+my_ss_start_age <- 67       # age SS payments begin
+```
+
+### What are your legacy goals and risk tolerance?
+
+```{r q_goals}
+my_bequest_target  <- 1500000  # desired bequest at death (today's $, 0 = don't care)
+my_max_ruin_prob   <- 0.08     # maximum acceptable probability of running out of money
+```
+
+
+## Load Mortality CDF
+
+Current age is extracted automatically from the mortality prediction file.
+
+```{r load_mortality, fig.width=9, fig.height=5}
+if (file.exists(mortality_path)) {
+  mc_mort <- readRDS(mortality_path)
+  mort_table <- mc_mort$mortality_table
+  my_current_age <- mc_mort$current_age
+  
+  cat("Loaded personalized mortality from:", mortality_path, "\n")
+  cat("Current age:          ", my_current_age, "\n")
+  cat("Median death age:     ", round(mc_mort$median_death_age, 1), "\n")
+  cat("Expected death age:   ", round(mc_mort$expected_death_age, 1), "\n")
+  cat("SD:                   ", round(mc_mort$sd_death_age, 1), "\n")
+} else {
+  cat("WARNING:", mortality_path, "not found.\n")
+  cat("Using Gompertz fallback. Set your age below:\n")
+  my_current_age <- 30  # <- only used if mortality file is missing
+  ages <- my_current_age:110
+  a <- 0.00003; b <- 0.085
+  haz <- a * exp(b * (ages - 30))
+  surv <- cumprod(1 - pmin(haz, 1))
+  dp <- c(1, surv[-length(surv)]) - surv
+  dp <- pmax(dp, 0); dp <- dp / sum(dp)
+  mort_table <- data.frame(
+    age = ages,
+    survival_prob = surv,
+    death_prob = dp,
+    cum_death_prob = cumsum(dp)
+  )
+  mc_mort <- list(
+    current_age = my_current_age,
+    median_death_age = ages[which.min(abs(cumsum(dp) - 0.5))],
+    expected_death_age = sum(ages * dp),
+    sd_death_age = sqrt(sum((ages - sum(ages * dp))^2 * dp)),
+    mortality_table = mort_table
+  )
+}
+
+# Plot mortality CDF
+ggplot(mort_table, aes(x = age, y = cum_death_prob)) +
+  geom_line(color = "firebrick", linewidth = 1.2) +
+  geom_vline(xintercept = mc_mort$median_death_age, linetype = "dashed") +
+  geom_vline(xintercept = my_retirement_age, linetype = "dotted", color = "steelblue") +
+  annotate("text", x = mc_mort$median_death_age + 1, y = 0.55,
+           label = paste0("Median death: ", round(mc_mort$median_death_age, 1)),
+           hjust = 0, size = 3.5) +
+  annotate("text", x = my_retirement_age + 1, y = 0.05,
+           label = paste0("Retirement: ", my_retirement_age),
+           hjust = 0, color = "steelblue", size = 3.5) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Personalized Mortality CDF",
+       x = "Age", y = "Cumulative Probability of Death") +
+  theme_minimal(base_size = 14)
+
+cat("\nQuestionnaire summary:\n")
+cat(sprintf("  Age now:              %d\n", my_current_age))
+cat(sprintf("  Retire at:            %d (in %d years)\n", my_retirement_age, my_retirement_age - my_current_age))
+cat(sprintf("  Current savings:      $%s\n", format(my_current_savings, big.mark = ",")))
+cat(sprintf("  Income:               $%s (growing %.1f%%/yr real)\n", format(my_current_income, big.mark = ","), my_real_income_growth * 100))
+cat(sprintf("  Savings rate:         %.0f%%\n", my_savings_rate * 100))
+cat(sprintf("  Retirement spending:  $%s/yr\n", format(my_annual_spending, big.mark = ",")))
+cat(sprintf("  Social Security:      $%s/yr starting age %d\n", format(my_ss_benefit, big.mark = ","), my_ss_start_age))
+cat(sprintf("  Bequest target:       $%s\n", format(my_bequest_target, big.mark = ",")))
+cat(sprintf("  Max acceptable ruin:  %.0f%%\n", my_max_ruin_prob * 100))
+```
+
+Note: Blanchett (2007, p. 67) claims there is a 50% chance of living beyond life expectancy. This conflates mean and median. Life expectancy is a mean, not a median, and population mortality distributions are almost exclusively left-skewed (early deaths pull the mean below the median), so the probability of surviving past life expectancy is typically greater than 50%.
+
+## Sample Death Ages
+
+```{r sample_deaths}
+# Sample death ages from the personalized mortality distribution
+sample_death_ages <- function(n, mort_table) {
+  u <- runif(n)
+  sapply(u, function(p) {
+    idx <- which(mort_table$cum_death_prob >= p)[1]
+    if (is.na(idx)) max(mort_table$age) else mort_table$age[idx]
+  })
+}
+
+set.seed(42)
+death_ages <- sample_death_ages(n_sims, mort_table)
+
+cat("Sampled death ages: mean =", round(mean(death_ages), 1),
+    "| median =", median(death_ages),
+    "| range =", min(death_ages), "-", max(death_ages), "\n")
+```
+
+## Full Lifecycle Simulation
+
+This simulates both the accumulation phase (working years with income and savings) and the distribution phase (retirement with withdrawals), using mortality weighted outcomes from the sampled death ages above. For each of the 43 Blanchett glide paths applied across the full lifespan, we compute P(ruin), P(bequest >= target), and median terminal wealth at death in real dollars.
+
+```{r lifecycle_sim, cache=TRUE, fig.width=10, fig.height=8}
+max_age <- max(mort_table$age)
+n_years_total <- max_age - my_current_age
+
+# -- Generate fresh returns for the full lifecycle
+set.seed(123)
+total_lc <- n_sims * n_years_total
+z_lc <- mvrnorm(n = total_lc, mu = mu_log, Sigma = cov_mat)
+r_lc <- exp(z_lc) - 1
+
+lc_cash   <- matrix(r_lc[, 1], nrow = n_sims, ncol = n_years_total)
+lc_bond   <- matrix(r_lc[, 2], nrow = n_sims, ncol = n_years_total)
+lc_dom_eq <- matrix(r_lc[, 3], nrow = n_sims, ncol = n_years_total)
+lc_intl   <- matrix(r_lc[, 4], nrow = n_sims, ncol = n_years_total)
+
+# -- Build full-lifespan glide paths (current age -> max age)
+# Each of the 43 types is regenerated over the FULL lifespan, not just 40 years
+lc_gp_list <- list()
+for (gp_name in names(gp_list)) {
+  gp <- gp_list[[gp_name]]
+  full_path <- make_glidepath(gp$start_eq, gp$type, n_years_total)
+  lc_gp_list[[gp_name]] <- list(
+    name = gp$name, type = gp$type, start_eq = gp$start_eq,
+    path = full_path
+  )
+}
+
+# -- Lifecycle simulation: uses full-span glide path for ALL years
+sim_lifecycle <- function(full_gp_path, death_ages,
+                           current_age, retirement_age, ss_start_age,
+                           current_savings, current_income, savings_rate,
+                           real_income_growth, annual_spending, ss_benefit,
+                           bequest_target) {
+  
+  n <- length(death_ages)
+  wealth  <- rep(current_savings, n)
+  income  <- rep(current_income, n)
+  spend   <- rep(annual_spending, n)
+  ss      <- rep(ss_benefit, n)
+  alive   <- rep(TRUE, n)
+  ruined  <- rep(FALSE, n)
+  
+  terminal_wealth <- rep(0, n)
+  
+  for (t in 1:n_years_total) {
+    age <- current_age + t
+    
+    # Check who is still alive
+    alive <- death_ages >= age
+    active <- alive & !ruined
+    if (!any(active)) break
+    
+    # -- Equity allocation from the full-lifespan glide path
+    eq <- full_gp_path[min(t, length(full_gp_path))]
+    
+    w_c <- (1 - eq) * 0.5;  w_b <- (1 - eq) * 0.5
+    w_d <- eq * (2/3);       w_i <- eq * (1/3)
+    
+    # -- Accumulation: add savings
+    if (age <= retirement_age) {
+      wealth[active] <- wealth[active] + income[active] * savings_rate
+    }
+    
+    # -- Portfolio return
+    port_r <- w_c * lc_cash[, t] + w_b * lc_bond[, t] +
+              w_d * lc_dom_eq[, t] + w_i * lc_intl[, t]
+    wealth[active] <- wealth[active] * (1 + port_r[active])
+    
+    # -- Distribution: withdraw spending
+    if (age > retirement_age) {
+      ss_yr <- ifelse(age >= ss_start_age, ss[active], 0)
+      needed <- pmax(spend[active] - ss_yr, 0)
+      wealth[active] <- wealth[active] - needed
+      
+      # Check ruin
+      new_ruin <- active & (wealth <= 0)
+      ruined[new_ruin] <- TRUE
+      wealth[ruined] <- 0
+    }
+    
+    # -- Income growth (real)
+    if (age <= retirement_age) {
+      income[active] <- income[active] * (1 + real_income_growth)
+    }
+    
+    # -- Record terminal wealth for those dying this year
+    dying <- (death_ages == age) & !ruined
+    terminal_wealth[dying] <- wealth[dying]
+    # Ruined and dying
+    terminal_wealth[death_ages == age & ruined] <- 0
+  }
+  
+  list(
+    p_ruin       = mean(ruined[death_ages > retirement_age]),
+    p_bequest    = mean(terminal_wealth >= bequest_target),
+    median_wealth = median(terminal_wealth),
+    q10_wealth   = quantile(terminal_wealth, 0.10),
+    q90_wealth   = quantile(terminal_wealth, 0.90),
+    terminal     = terminal_wealth
+  )
+}
+
+# -- Run across all 43 glide paths
+cat("Running personalized lifecycle simulation across 43 glide paths...\n")
+t0 <- Sys.time()
+
+personal_results <- data.frame()
+
+for (gp_name in names(lc_gp_list)) {
+  gp <- lc_gp_list[[gp_name]]
+  
+  res <- sim_lifecycle(
+    full_gp_path    = gp$path,
+    death_ages      = death_ages,
+    current_age     = my_current_age,
+    retirement_age  = my_retirement_age,
+    ss_start_age    = my_ss_start_age,
+    current_savings = my_current_savings,
+    current_income  = my_current_income,
+    savings_rate    = my_savings_rate,
+    real_income_growth = my_real_income_growth,
+    annual_spending = my_annual_spending,
+    ss_benefit      = my_ss_benefit,
+    bequest_target  = my_bequest_target
+  )
+  
+  personal_results <- bind_rows(personal_results, data.frame(
+    glidepath   = gp_name,
+    type        = gp$type,
+    start_eq    = gp$start_eq,
+    p_ruin      = res$p_ruin,
+    p_bequest   = res$p_bequest,
+    median_wealth = res$median_wealth,
+    q10         = as.numeric(res$q10_wealth),
+    q90         = as.numeric(res$q90_wealth),
+    stringsAsFactors = FALSE
+  ))
+}
+
+elapsed_lc <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+cat(sprintf("Done: Done in %.1f seconds.\n", elapsed_lc))
+```
+
+## Results: All Glide Paths Ranked
+
+```{r personal_ranking}
+# Rank by: feasible (P(ruin) <= target), then highest P(bequest)
+personal_results <- personal_results %>%
+  mutate(feasible = p_ruin <= my_max_ruin_prob) %>%
+  arrange(!feasible, p_ruin, -p_bequest)
+
+cat(sprintf("Feasible glide paths (P(ruin) <= %.0f%%): %d of %d\n",
+            my_max_ruin_prob * 100, sum(personal_results$feasible), nrow(personal_results)))
+
+top20 <- personal_results %>% head(20)
+
+cat("\nTop 20 Glide Paths  --  Ranked by P(Ruin) then P(Bequest)\n")
+cat(paste(rep("-", 105), collapse = ""), "\n")
+cat(sprintf("%-22s %-10s %8s %10s %15s %15s %15s %8s\n",
+            "Glide Path", "Type", "P(Ruin)", "P(Bequest)", "Median $", "10th Pctl", "90th Pctl", "Feasible"))
+cat(paste(rep("-", 105), collapse = ""), "\n")
+for (i in 1:nrow(top20)) {
+  r <- top20[i, ]
+  cat(sprintf("%-22s %-10s %7.1f%% %9.1f%% %15s %15s %15s %8s\n",
+              r$glidepath, r$type,
+              r$p_ruin * 100, r$p_bequest * 100,
+              paste0("$", format(round(r$median_wealth), big.mark = ",")),
+              paste0("$", format(round(r$q10), big.mark = ",")),
+              paste0("$", format(round(r$q90), big.mark = ",")),
+              ifelse(r$feasible, "YES", "NO")))
+}
+cat(paste(rep("-", 105), collapse = ""), "\n")
+```
+
+## Optimal Glide Path
+
+```{r optimal_gp, fig.width=10, fig.height=5}
+# Select best feasible path; if none, take lowest ruin
+if (any(personal_results$feasible)) {
+  best <- personal_results %>% filter(feasible) %>% 
+    arrange(-p_bequest, p_ruin) %>% slice(1)
+} else {
+  cat("WARNING: No glide path meets the ruin constraint. Using min-ruin.\n")
+  best <- personal_results %>% arrange(p_ruin) %>% slice(1)
+}
+
+best_gp <- lc_gp_list[[best$glidepath]]
+
+cat("=== YOUR OPTIMAL LIFETIME GLIDE PATH ===\n\n")
+cat(sprintf("  Glide path:       %s\n", best$glidepath))
+cat(sprintf("  Type:             %s\n", best$type))
+cat(sprintf("  Starting equity:  %.0f%%\n", best$start_eq * 100))
+cat(sprintf("  P(Ruin):          %.1f%%\n", best$p_ruin * 100))
+cat(sprintf("  P(Bequest >= $%s): %.1f%%\n",
+            format(my_bequest_target, big.mark = ","),
+            best$p_bequest * 100))
+cat(sprintf("  Median wealth:    $%s\n",
+            format(round(best$median_wealth), big.mark = ",")))
+
+# Plot the full lifecycle allocation from the glide path
+full_path <- data.frame(
+  age = (my_current_age + 1):max_age,
+  year = 1:n_years_total
+) %>%
+  mutate(
+    phase = ifelse(age <= my_retirement_age, "Accumulation", "Distribution"),
+    equity = best_gp$path[pmin(year, length(best_gp$path))],
+    bonds = 1 - equity
+  ) %>%
+  pivot_longer(cols = c(equity, bonds), names_to = "asset", values_to = "weight") %>%
+  mutate(asset = factor(asset, levels = c("bonds", "equity")))
+
+ggplot(full_path, aes(x = age, y = weight, fill = asset)) +
+  geom_area(alpha = 0.8) +
+  geom_vline(xintercept = my_retirement_age, linetype = "dashed", color = "grey30") +
+  geom_vline(xintercept = mc_mort$median_death_age, linetype = "dotted", color = "firebrick") +
+  annotate("text", x = my_retirement_age + 1, y = 0.97, 
+           label = paste("Retire:", my_retirement_age), hjust = 0, size = 3.5) +
+  annotate("text", x = mc_mort$median_death_age + 1, y = 0.85,
+           label = paste("Median death:", round(mc_mort$median_death_age, 1)),
+           hjust = 0, size = 3.5, color = "firebrick") +
+  scale_fill_manual(values = c(equity = "darkorange", bonds = "steelblue"),
+                    labels = c(equity = "Stocks", bonds = "Bonds")) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = sprintf("Your Lifetime Equity Glide Path: %s", best$glidepath),
+       subtitle = sprintf("Start: %.0f%% equity | P(ruin)=%.1f%% | P(bequest>=$%sk)=%.1f%%",
+                          best$start_eq * 100,
+                          best$p_ruin * 100, format(my_bequest_target/1000, big.mark=","),
+                          best$p_bequest * 100),
+       x = "Age", y = "Allocation", fill = "") +
+  theme_minimal(base_size = 14)
+```
+
+## P(Ruin) vs P(Bequest) Frontier
+
+```{r frontier, fig.width=10, fig.height=7}
+ggplot(personal_results, aes(x = p_ruin * 100, y = p_bequest * 100, 
+                              color = type, shape = feasible)) +
+  geom_point(size = 3, alpha = 0.8) +
+  geom_point(data = personal_results %>% filter(glidepath == best$glidepath),
+             aes(x = p_ruin * 100, y = p_bequest * 100),
+             color = "red", size = 6, shape = 18) +
+  geom_vline(xintercept = my_max_ruin_prob * 100, linetype = "dashed", color = "grey50") +
+  annotate("text", x = my_max_ruin_prob * 100 + 0.5, y = max(personal_results$p_bequest) * 100,
+           label = paste0("Max ruin: ", my_max_ruin_prob * 100, "%"),
+           hjust = 0, size = 3.5) +
+  scale_shape_manual(values = c(`FALSE` = 1, `TRUE` = 16)) +
+  labs(title = "Ruin-Bequest Frontier Across All 43 Glide Paths",
+       subtitle = sprintf("Red diamond = optimal (%s)", best$glidepath),
+       x = "P(Ruin) %", y = sprintf("P(Bequest >= $%s) %%", 
+                                      format(my_bequest_target, big.mark = ",")),
+       color = "GP Type", shape = "Feasible") +
+  theme_minimal(base_size = 14)
+```
+
+## Income & Savings Trajectory
+
+```{r income_trajectory, fig.width=10, fig.height=5}
+income_path <- data.frame(age = my_current_age:(my_retirement_age)) %>%
+  mutate(
+    year = age - my_current_age,
+    income = my_current_income * (1 + my_real_income_growth)^year,
+    annual_savings = income * my_savings_rate,
+    cumulative_savings = cumsum(annual_savings) + my_current_savings
+  )
+
+ggplot(income_path, aes(x = age)) +
+  geom_line(aes(y = income, color = "Income"), linewidth = 1) +
+  geom_line(aes(y = annual_savings, color = "Annual Savings"), linewidth = 1) +
+  geom_line(aes(y = cumulative_savings, color = "Cumulative Savings (no returns)"), 
+            linewidth = 1, linetype = "dashed") +
+  scale_y_continuous(labels = dollar_format()) +
+  scale_color_manual(values = c("Income" = "steelblue", "Annual Savings" = "darkgreen",
+                                 "Cumulative Savings (no returns)" = "grey50")) +
+  labs(title = "Projected Income & Savings (Real $, No Investment Returns)",
+       x = "Age", y = "Annual Amount", color = "") +
+  theme_minimal(base_size = 14)
+```
+
+## Spending Sensitivity
+
+```{r spending_sens, fig.width=10, fig.height=6}
+spend_levels <- seq(40000, 120000, by = 5000)
+spend_sens <- data.frame()
+
+for (s in spend_levels) {
+  res <- sim_lifecycle(
+    full_gp_path = best_gp$path,
+    death_ages = death_ages, current_age = my_current_age,
+    retirement_age = my_retirement_age, ss_start_age = my_ss_start_age,
+    current_savings = my_current_savings, current_income = my_current_income,
+    savings_rate = my_savings_rate, real_income_growth = my_real_income_growth,
+    annual_spending = s, ss_benefit = my_ss_benefit, bequest_target = my_bequest_target
+  )
+  spend_sens <- bind_rows(spend_sens, data.frame(
+    spending = s, p_ruin = res$p_ruin, p_bequest = res$p_bequest
+  ))
+}
+
+spend_sens %>%
+  pivot_longer(cols = c(p_ruin, p_bequest), names_to = "metric", values_to = "prob") %>%
+  mutate(metric = ifelse(metric == "p_ruin", "P(Ruin)", "P(Bequest)")) %>%
+  ggplot(aes(spending, prob, color = metric)) +
+  geom_line(linewidth = 1.2) + geom_point(size = 2) +
+  geom_vline(xintercept = my_annual_spending, linetype = "dashed") +
+  geom_hline(yintercept = my_max_ruin_prob, linetype = "dotted", color = "grey50") +
+  scale_color_manual(values = c("P(Ruin)" = "firebrick", "P(Bequest)" = "steelblue")) +
+  scale_x_continuous(labels = dollar_format()) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 1)) +
+  labs(title = sprintf("Spending Sensitivity  --  %s Glide Path", best$glidepath),
+       x = "Annual Spending (today's $)", y = "Probability", color = "") +
+  theme_minimal(base_size = 14)
+```
+
+# References
+
+- Blanchett, D. M. (2007). Dynamic Allocation Strategies for Distribution
+  Portfolios: Determining the Optimal Distribution Glide Path. *Journal of
+  Financial Planning*, 20(12), 66--83.
+
+
+*Simulation: `r format(n_sims, big.mark=",")` Monte Carlo paths x
+`r length(gp_list)` glide paths x `r length(dist_periods) * length(wr_rates)`
+scenarios = `r format(length(gp_list) * length(dist_periods) * length(wr_rates), big.mark=",")` total runs. Seed: 42.*
